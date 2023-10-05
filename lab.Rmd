@@ -1,0 +1,1372 @@
+---
+title: "R Notebook"
+output: html_notebook
+---
+
+# Loading data
+
+```{r}
+#source('requirements.R')
+library(tidyverse)
+library(tidytext)
+library(extrafont)
+library(hrbrthemes)
+library(Hmisc)
+library(ggcorrplot)
+library(corrplot)
+library(showtext)
+library(broom)
+
+hrbrthemes::import_roboto_condensed()
+hrbrthemes::import_public_sans()
+options(scipen=999)
+showtext::showtext_auto()
+showtext::showtext_opts(dpi = 300)
+extrafont::font_import() #
+extrafont::loadfonts(device='pdf')
+```
+
+What does this data look like?
+
+```{r}
+data=read_csv('BCV data science take home_data set.csv')
+head(data)
+```
+
+# Preprocessing
+
+## Dropping rows with missing values
+
+List of criteria
+
+-   Has category and category groups (731 rows dropped)
+
+-   Has raised an amount (5030 rows dropped)
+
+```{r}
+data = data %>% filter(!is.na(CATEGORY_LIST) & !is.na(CATEGORY_GROUPS_LIST)) 
+data = data %>% filter(!is.na(RAISED_AMOUNT_USD)) 
+data = data %>% filter(!is.na(TOTAL_FUNDING_USD)) 
+```
+
+## \~Detecting and removing outliers
+
+Proposed criteria **for exploratory analysis.**
+
+-   Have not raised more than 100M in any round
+-   Remove 1% and 99% of a variable (e.g. `RAISED_AMOUNT_USD`)
+
+## Confirming assumptions
+
+-   Data covers investments made in 2021, 2022, or 2023
+
+```{r}
+year_df = data #%>%
+year_df$lastfunding_year <- as.numeric(format(year_df$LAST_FUNDING_ON, "%Y"))
+year_df %>% group_by(lastfunding_year) %>% tally()
+```
+
+This confirms that the dataset consists of three years of investments.
+
+# Dataset Exploration
+
+## Metadata issues
+
+Some of the variable names have "...#" at the end, where \# is the column number. This is not consistent and suggests the data is a result of queries that have some naming collisions. Without making assumptions about the source of those collisions upstream, I want to confirm that some of these UUIDs are referencing the same entity.
+
+```{r}
+sum(data$UUID...1 == data$ORG_UUID) # returns 22301 if rows not dropped
+dim(data)
+```
+
+This suggests that UUID...1 and ORG_UUID are the same variable.
+
+I registered for a Crunchbase API Basic Key and started checking the UUIDs using the following endpoint:
+
+```         
+https://api.crunchbase.com/api/v4/entities/organizations/
+```
+
+This allowed me to confirm that the `ORG_UUID` is the same as Crunchbase's.
+
+## NAs
+
+A lot of columns are missing some values. This lets us know how many per field. There are a lot of reasons for missing values. Some could be addressed by revisiting Crunchbase, in case there was a problem with an upstream query. There are still many other reasons for these NAs, and I won't exhaustively track them all down here. For now, a record of what fields have NAs.
+
+```{r}
+colSums(sapply(data, is.na))
+```
+
+## Other explorations
+
+I also did a lot of exploration of some of these other variables not documented here. This was mostly to develop some intuition about this data. Most of this can be further explored in the "Scratch" section of this notebook. Examples:
+
+-   Other variables like `FOUNDED_ON` (some companies claiming some incredible founding dates).
+
+-   Year by year patterns.
+
+# Sector and Category Exploration
+
+`CATEGORY_LIST` and `CATEGORY_GROUP_LIST` seem to be the most likely sector variables.
+
+Some appear to be tags more than sectors. It's not immediately clear what the differences are, and the API definition isn't immediately useful.
+
+We'll have to do some data wrangling to get one category or category group per row if we want to investigate broad and specific categories for investment patterns by individual categories or category groups.
+
+```{r}
+cats = data %>% 
+  separate_longer_delim(CATEGORY_LIST, delim=',') %>%
+  mutate(year=year(LAST_FUNDING_ON))
+
+cats %>% group_by(CATEGORY_LIST, year) %>% 
+  tally() %>% 
+  arrange(year, -n)
+
+length(unique(cats$CATEGORY_LIST)) #697 values
+
+catgroups = data %>% 
+  separate_longer_delim(CATEGORY_GROUPS_LIST, delim=',') %>%
+  mutate(year=year(LAST_FUNDING_ON))
+
+catgroups %>% 
+  group_by(CATEGORY_GROUPS_LIST, year) %>% 
+  tally() %>% 
+  arrange(year, -n) 
+
+length(unique(catgroups$CATEGORY_GROUPS_LIST)) #47 results
+```
+
+This suggests that the `CATEGORY_LIST` variable is more fine-grained than the `CATEGORY_GROUPS_LIST` variable by a factor of 10.
+
+## Average Amount Raised By Stage
+
+```{r}
+fig=data %>% 
+mutate(year=year(data$LAST_FUNDING_ON)) %>%
+ filter(between(RAISED_AMOUNT_USD, 
+                quantile(RAISED_AMOUNT_USD, .01), 
+                quantile(RAISED_AMOUNT_USD, .99))) %>%
+  group_by(year, INVESTMENT_TYPE) %>%
+  summarise(avgraise = mean(RAISED_AMOUNT_USD, na.rm=T)) %>%
+  ggplot(aes(year,avgraise,fill=INVESTMENT_TYPE)) +
+      geom_bar(position="dodge",stat="identity") +
+      scale_y_continuous(labels = scales::unit_format(unit = "M", scale = 1e-7)) +
+    theme_ipsum() +
+    scale_fill_ipsum() +
+    labs(
+      title="Average Amount Raised By Stage",
+      x="Year of Investments",
+      y="Average amount raised",
+      fill="Investment Round",
+      caption="(With bottom and top 1 percent removed)"
+    ) 
+  ggsave(fig, filename='plots/avg_raise_size_by_stage.png',width=10)
+```
+
+## Distribution of Amount Raised by Stage
+
+```{r}
+fig=cats %>% 
+  filter(between(RAISED_AMOUNT_USD, 
+                 quantile(RAISED_AMOUNT_USD, .01), 
+                 quantile(RAISED_AMOUNT_USD, .99))) %>%
+  group_by(INVESTMENT_TYPE) %>%
+  ggplot(aes(
+    x=INVESTMENT_TYPE,
+    y=RAISED_AMOUNT_USD
+  )) + 
+  scale_y_continuous(labels = scales::unit_format(unit = "M", scale = 1e-7)) +
+  geom_boxplot() +
+  theme_ipsum_rc() +
+  labs(
+    x="",
+    y="Amount Raised in USD",
+    title="Distribution of Amount Raised By Stage",
+    caption="(With bottom and top 1% of all raises excluded)"
+  ) 
+  ggsave(fig,filename='plots/dist_amount_raised_bystage.png',width=10)
+```
+
+## Total Number of Investments Per Sector Across All Rounds
+
+```{r}
+fig=catgroups %>% 
+  group_by(CATEGORY_GROUPS_LIST) %>% 
+  tally() %>% 
+  arrange(-n) %>%
+  ggplot(aes(
+      x=reorder(CATEGORY_GROUPS_LIST,n),
+      y=n
+  )) +
+  geom_bar(stat='identity') +
+  coord_flip() +
+  labs(
+    x="",
+    y="Count of companies that raised investment",
+    title='Total Number of Investments Per Sector Across All Rounds'
+  ) +
+  theme_ipsum()
+
+  ggsave(fig,filename='plots/total_investments_sector.png',width=12,height=8)
+```
+
+## Total Amount Raised Per Sector Across All Rounds
+
+```{r}
+fig=catgroups %>% 
+  group_by(CATEGORY_GROUPS_LIST) %>%
+  summarise(totalraised = sum(RAISED_AMOUNT_USD, na.rm=T)) %>%
+  ggplot(aes(
+    x=reorder(CATEGORY_GROUPS_LIST, totalraised),
+    y=totalraised
+  )) + 
+  geom_bar(position='dodge', stat='identity') +
+  coord_flip() +
+  scale_y_continuous(labels = scales::unit_format(unit = "B", scale = 1e-9))+
+  theme_ipsum() +
+  labs(
+    x='',
+    y='Total raised (in billions USD)',
+    title='Total Amount Raised Per Sector Across All Rounds'
+  )
+ggsave(fig,filename='plots/total_raised_sector.png', width=10,height=8)
+```
+
+## Top Investment Categories By Amount Raised And Stage
+
+```{r}
+fig=cats %>% 
+  group_by(INVESTMENT_TYPE, CATEGORY_LIST) %>% 
+  summarise(mean=mean(RAISED_AMOUNT_USD)) %>%
+  arrange(desc(mean), .by_group = TRUE) %>%
+  ungroup() %>% group_by(INVESTMENT_TYPE) %>%
+  filter(mean > quantile(mean, .99) & INVESTMENT_TYPE=='seed') %>%
+  ggplot(aes(
+    x=reorder(CATEGORY_LIST, mean),
+    y=mean
+  )) + 
+  geom_bar(stat='identity') +
+  coord_flip() +
+  scale_y_continuous(labels = scales::unit_format(unit = "M", scale = 1e-7)) +
+  theme_ipsum_rc() +
+  labs(
+    x='',
+    y='Average Raise Amount',
+    title='Top 1% Categories in Seed Rounds'
+  )
+#ggsave(fig, filename='plots/top_cats_by_avgraise_seed.pdf',width=10)
+ggsave(fig, filename='plots/_top_cats_by_avgraise_seed.png',width=10)
+
+fig=cats %>% 
+  group_by(INVESTMENT_TYPE, CATEGORY_LIST) %>% 
+  summarise(mean=mean(RAISED_AMOUNT_USD)) %>%
+  arrange(desc(mean), .by_group = TRUE) %>%
+  ungroup() %>% group_by(INVESTMENT_TYPE) %>%
+  filter(mean > quantile(mean, .99) & INVESTMENT_TYPE=='series_a') %>%
+  ggplot(aes(
+    x=reorder(CATEGORY_LIST, mean),
+    y=mean
+  )) + 
+  geom_bar(stat='identity') +
+  coord_flip() +
+  scale_y_continuous(labels = scales::unit_format(unit = "M", scale = 1e-7)) +
+  theme_ipsum() +
+  labs(
+    x='',
+    y='Average Raise Amount',
+    title='Top 1% Categories in Series A Rounds')
+  
+#ggsave(fig, filename='plots/top_cats_by_avgraise_seriesa.pdf',width=10)
+ggsave(fig, filename='plots/_top_cats_by_avgraise_seriesa.png',width=10)
+
+fig=cats %>% 
+  group_by(INVESTMENT_TYPE, CATEGORY_LIST) %>% 
+  summarise(mean=mean(RAISED_AMOUNT_USD)) %>%
+  arrange(desc(mean), .by_group = TRUE) %>%
+  ungroup() %>% group_by(INVESTMENT_TYPE) %>%
+  filter(mean > quantile(mean, .99) & INVESTMENT_TYPE=='series_b') %>%
+  ggplot(aes(
+    x=reorder(CATEGORY_LIST, mean),
+    y=mean
+  )) + 
+  geom_bar(stat='identity') +
+  coord_flip() +
+  scale_y_continuous(labels = scales::unit_format(unit = "M", scale = 1e-7)) + 
+  theme_ipsum() +
+    labs(
+    x='',
+    y='Average Raise Amount',
+    title='Top 1% Categories in Series B Rounds')
+
+#ggsave(fig, filename='plots/top_cats_by_avgraise_seriesb.pdf', width=10)
+ggsave(fig, filename='plots/_top_cats_by_avgraise_seriesb.png', width=10)
+
+```
+
+## Top Investment Categories by Number of Investors
+
+```{r}
+fig=cats %>% 
+  group_by(INVESTMENT_TYPE, CATEGORY_LIST) %>% 
+  summarise(mean=mean(INVESTOR_COUNT, na.rm=T)) %>%
+  arrange(desc(mean), .by_group = TRUE) %>%
+  filter(mean > quantile(mean, .99, na.rm=T)) %>%
+  filter(INVESTMENT_TYPE=='seed') %>%
+  ggplot(aes(
+    x=reorder(CATEGORY_LIST, mean),
+    y=mean
+  )) + 
+  geom_bar(stat='identity') +
+  theme_ipsum() +
+  labs(
+    x='',
+    y='Average Amount of Investors',
+    title='Top 1% Categories in Seed Rounds') +
+  coord_flip() 
+#ggsave(fig, filename='plots/top_cats_by_investors_seed.pdf',width=10)
+ggsave(fig, filename='plots/top_cats_by_investors_seed.png',width=10)
+
+fig=cats %>% 
+  group_by(INVESTMENT_TYPE, CATEGORY_LIST) %>% 
+  summarise(mean=mean(INVESTOR_COUNT, na.rm=T)) %>%
+  arrange(desc(mean), .by_group = TRUE) %>%
+  filter(mean > quantile(mean, .99, na.rm=T)) %>%
+  filter(INVESTMENT_TYPE=='series_a') %>%
+  ggplot(aes(
+    x=reorder(CATEGORY_LIST, mean),
+    y=mean
+  )) + 
+  geom_bar(stat='identity') +
+  theme_ipsum() +
+  labs(
+    x='',
+    y='Average Amount of Investors',
+    title='Top 1% Categories in Series A Rounds') +
+  coord_flip()
+#ggsave(fig, filename='plots/top_cats_by_investors_seriesa.pdf',width=10)
+ggsave(fig, filename='plots/top_cats_by_investors_seriesa.png',width=10)
+
+fig=cats %>% 
+  group_by(INVESTMENT_TYPE, CATEGORY_LIST) %>% 
+  summarise(mean=mean(INVESTOR_COUNT, na.rm=T)) %>%
+  arrange(desc(mean), .by_group = TRUE) %>%
+  filter(mean > quantile(mean, .99, na.rm=T)) %>%
+  filter(INVESTMENT_TYPE=='series_b') %>%
+  ggplot(aes(
+    x=reorder(CATEGORY_LIST, mean),
+    y=mean
+  )) + 
+  geom_bar(stat='identity') +
+  theme_ipsum() +
+  labs(
+    x='',
+    y='Average Amount of Investors',
+    title='Top 1% Categories in Seed Rounds') +
+  coord_flip() 
+  #ggsave(fig, filename='plots/top_cats_by_investors_seriesb.pdf',width=10)
+  ggsave(fig, filename='plots/top_cats_by_investors_seriesb.png',width=10)
+
+```
+
+# H1'23 vs H1'22 geographical analysis
+
+```{r}
+geo = data %>%
+  mutate(h1 = case_when(
+    (LAST_FUNDING_ON >= "2022-01-01") & (LAST_FUNDING_ON<= "2022-06-30") ~ "H122",
+(LAST_FUNDING_ON >= "2023-01-01") & (LAST_FUNDING_ON<= "2023-06-30") ~ "H123")) %>%
+  filter(!is.na(h1)) %>%
+  select(
+    'CITY'=CITY...16,
+    'FULLSTATE'=REGION...15,
+    'STATE'=STATE_CODE...14,
+    'COUNTRY'=COUNTRY_CODE...13,
+    RAISED_AMOUNT_USD,
+    TOTAL_FUNDING_USD,
+    POST_MONEY_VALUATION_USD,
+    NUM_FUNDING_ROUNDS,
+    INVESTMENT_TYPE,
+    INVESTOR_COUNT,
+    ORG_NAME,
+    ORG_UUID,
+    CATEGORY_LIST,
+    CATEGORY_GROUPS_LIST,
+    h1
+  )
+```
+
+```{r}
+citysummary=geo %>%
+  group_by(CITY, STATE, INVESTMENT_TYPE, h1) %>%
+  #group_by(CITY, STATE, h1) %>%
+  summarise(
+    #avgraise=mean(RAISED_AMOUNT_USD),
+    #medraise=median(RAISED_AMOUNT_USD),
+    #avgtotal=mean(TOTAL_FUNDING_USD),
+    #avginvestors=mean(INVESTOR_COUNT,na.rm=T),
+    #avgrounds=mean(NUM_FUNDING_ROUNDS,na.rm=T),
+    n=n()) %>%
+  arrange(-n)
+```
+
+## Top 11 Cities By Number of Investments Over All Stages
+
+```{r}
+topcities=geo %>%
+  group_by(CITY, STATE, h1) %>%
+  summarise(n=n()) %>%
+  ungroup() %>% group_by(h1) %>%
+  arrange(-n) %>%
+  slice_max(n,n=10)
+
+fig=geo %>% 
+  filter(CITY %in% topcities$CITY) %>%
+  group_by(CITY, STATE, h1) %>%
+  summarise(n=n()) %>%
+  ungroup() %>% group_by(h1) %>%
+  arrange(-n) %>%
+  ggplot(aes(
+    x=reorder(CITY,n),
+    y=n,
+    fill=h1
+  )) +
+  geom_bar(stat='identity', position='dodge') +
+  theme_ipsum() +
+  scale_fill_ipsum() +
+  labs(
+    x='',
+    y='',
+    fill='Year',
+    title='Top 11 Cities by Number of Investments Over All Stages'
+  )
+ggsave(fig, filename='plots/topcities_byinvestors.png',width=12.75)
+```
+
+## Top 11 Cities by Number of Investments By Stage
+
+```{r}
+topcities=geo %>%
+  group_by(CITY, STATE, h1) %>%
+  summarise(n=n()) %>%
+  ungroup() %>% group_by(h1) %>%
+  arrange(-n) %>%
+  slice_max(n,n=10)
+
+fig=geo %>% 
+  filter(CITY %in% topcities$CITY) %>%
+  group_by(CITY, STATE, h1, INVESTMENT_TYPE) %>%
+  summarise(n=n()) %>%
+  ungroup() %>% group_by(h1) %>%
+  arrange(-n) %>%
+  ggplot(aes(
+    x=reorder_within(CITY,n, INVESTMENT_TYPE),
+    y=n,
+    fill=h1
+  )) +
+  geom_bar(stat='identity', position='dodge') +
+  scale_x_reordered() +
+  facet_wrap(~INVESTMENT_TYPE, ncol=1, scales='free') +
+  theme_ipsum() +
+  scale_fill_ipsum() +
+  labs(
+    x='',
+    y='',
+    fill='Year',
+    title='Top 11 Cities by Number of Investments By Stage'
+  )
+ggsave(fig, filename='plots/topcities_byinvestors_bystage.png',width=15,height=12)
+```
+
+```{r}
+fig=citysummary %>%
+  ungroup() %>% group_by(h1, INVESTMENT_TYPE) %>%
+  arrange(n) %>%
+  slice_max(n,n=10) %>%
+  ggplot(aes(
+    x=reorder_within(CITY,n, INVESTMENT_TYPE),
+    y=n,
+    fill=h1
+  )) +
+  geom_bar(stat='identity', position='dodge') +
+  scale_x_reordered() +
+  facet_wrap(~INVESTMENT_TYPE, scales='free',ncol=1) + 
+  coord_flip() + 
+  theme_ipsum() +
+  scale_fill_ipsum() +
+  labs(
+    x='',
+    y='',
+    title='Top 10 Cities by Number of Investments per Stage'
+  )
+ggsave(fig, filename='plots/topcities_byinvestors.png',width=15,height=12)
+```
+
+## Cities with biggest drops from '22 to '23 Over All Stages
+
+```{r}
+fig=geo %>%
+  group_by(CITY, STATE, h1) %>%
+  summarise(n=n()) %>%
+  arrange(-n) %>%
+  arrange(desc(h1)) %>%
+  mutate(delta=n-lead(n, default=last(n))) %>%
+  arrange(delta) %>%
+  ungroup() %>% group_by(delta) %>%
+  ungroup() %>%
+  filter(delta <= quantile(delta,.01) | delta >= quantile(delta,.99)) %>%
+  ggplot(aes(
+    x=delta,
+    y=reorder(CITY, -delta)
+  )) +
+  geom_bar(stat='identity') +
+  theme_ipsum() +
+  labs(
+    title="Cities with Biggest Drops and Gains in Number of Investments from '22 to '23",
+    x="Difference between '22 and '23",
+    y='',
+    caption='(Top and bottom 1% of all changes over cities)'
+  )
+ggsave(fig,filename='plots/cities_biggest_deltas.png',width=12)
+```
+
+## Cities with biggest drops from '22 to '23 Per Stage
+
+```{r}
+fig=geo %>%
+  filter(INVESTMENT_TYPE=='seed') %>%
+  group_by(CITY, STATE, h1) %>%
+  summarise(n=n()) %>%
+  arrange(-n) %>%
+  arrange(desc(h1)) %>%
+  mutate(delta=n-lead(n, default=last(n))) %>%
+  arrange(delta) %>%
+  ungroup() %>% group_by(delta) %>%
+  ungroup() %>%
+  filter(delta <= quantile(delta,.01) | delta >= quantile(delta,.99)) %>%
+  ggplot(aes(
+    x=delta,
+    y=reorder(CITY, -delta)
+  )) +
+  geom_bar(stat='identity') +
+  theme_ipsum() +
+  labs(
+    title='Cities with Biggest Drops and Gains in Number of Seed Investments',
+    x="Difference between '22 and '23",
+    y='',
+    caption='(Top and bottom 1% of all changes over cities)'
+    
+  )
+ggsave(fig,filename='plots/cities_biggest_deltas_seed.png',width=11)
+
+fig=geo %>%
+  filter(INVESTMENT_TYPE=='series_a') %>%
+  group_by(CITY, STATE, h1) %>%
+  summarise(n=n()) %>%
+  arrange(-n) %>%
+  arrange(desc(h1)) %>%
+  mutate(delta=n-lead(n, default=last(n))) %>%
+  arrange(delta) %>%
+  ungroup() %>% group_by(delta) %>%
+  ungroup() %>%
+  filter(delta <= quantile(delta,.01) | delta >= quantile(delta,.99)) %>%
+  ggplot(aes(
+    x=delta,
+    y=reorder(CITY, -delta)
+  )) +
+  geom_bar(stat='identity') +
+  theme_ipsum() +
+  labs(
+    title='Cities with Biggest Drops and Gains in Number of Series A Investments',
+    x="Difference between '22 and '23",
+    y='',
+    caption='(Top and bottom 1% of all changes over cities)'
+  )
+ggsave(fig,filename='plots/cities_biggest_deltas_seriesa.png',width=11)
+
+fig=geo %>%
+  filter(INVESTMENT_TYPE=='series_b') %>%
+  group_by(CITY, STATE, h1) %>%
+  summarise(n=n()) %>%
+  arrange(-n) %>%
+  arrange(desc(h1)) %>%
+  mutate(delta=n-lead(n, default=last(n))) %>%
+  arrange(delta) %>%
+  ungroup() %>% group_by(delta) %>%
+  ungroup() %>%
+  filter(
+    delta <= quantile(delta,.01) | delta >= quantile(delta,.99)) %>%
+  ggplot(aes(
+    x=delta,
+    y=reorder(CITY, -delta)
+  )) +
+  geom_bar(stat='identity') +
+  theme_ipsum() +
+  labs(
+    title='Cities with Biggest Drops and Gains in Number of Series B Investments',
+    x="Difference between '22 and '23",
+    y='',
+    caption='(Top and bottom 1% of all changes over cities)'
+  )
+ggsave(fig,filename='plots/cities_biggest_deltas_seriesb.png',width=11)
+```
+
+# Top Investors
+
+```{r}
+investors = data %>%
+  filter(!is.na(LEAD_INVESTOR_UUIDS)) %>%
+  separate_longer_delim(LEAD_INVESTOR_UUIDS, delim=',') %>%
+  dplyr::select(LEAD_INVESTOR_UUIDS,
+         RAISED_AMOUNT_USD,
+         TOTAL_FUNDING_USD,
+         PRIMARY_ROLE,
+         ORG_UUID,
+         ORG_NAME,
+         CATEGORY_LIST,
+         CATEGORY_GROUPS_LIST,
+         INVESTMENT_TYPE)
+
+#Join the investors names and permalinks to the dataset
+investors_lookup = read_csv('investors.csv')
+#investors=left_join(investors, investors_lookup, by=c('LEAD_INVESTOR_UUIDS'='id'))
+
+#This is the code used to produce the investors_uuid.csv file that we use to inform our API requests for their names and permalinks.
+#df = na.omit(as.data.frame(unique(investors$LEAD_INVESTOR_UUIDS)))
+#write_delim(df, "investors_uuid.csv", col_names = FALSE, delim=',')
+
+```
+
+## Top Investors By Number of Investments
+
+```{r}
+fig=investors %>%
+  group_by(LEAD_INVESTOR_UUIDS, INVESTMENT_TYPE) %>%
+  tally() %>%
+  arrange(-n) %>%
+  ungroup() %>% group_by(INVESTMENT_TYPE) %>%
+  slice_max(n, n=10) %>%
+  left_join(investors_lookup, by=c('LEAD_INVESTOR_UUIDS'='id')) %>%
+  ggplot(aes(
+    x=reorder_within(name,n,INVESTMENT_TYPE),
+    y=n
+  )) +
+  geom_bar(stat='identity') +
+  scale_x_reordered() +
+  facet_wrap(~INVESTMENT_TYPE, scales='free') +
+  coord_flip() +
+  theme_ipsum() +
+  labs(
+    x='',
+    y='Amount of lead investments',
+    title='Top 12 Investors by Stage and Number of Lead Investments'
+  )
+ggsave(fig, filename='plots/top12investors_numleads.png',width=12)
+```
+
+## What categories are getting the most investments from the top 5% of investors?
+
+```{r}
+topinvestors = investors %>%
+  group_by(LEAD_INVESTOR_UUIDS) %>%
+  tally() %>%
+  arrange(-n) %>%
+  filter(n>quantile(n,.95)) %>% 
+  select('id'=LEAD_INVESTOR_UUIDS) %>%
+    left_join(investors_lookup, by='id')
+  
+fig=cats %>%
+  filter(LEAD_INVESTOR_UUIDS %in% topinvestors$id) %>%
+  group_by(CATEGORY_LIST) %>% 
+  summarise(n=n()) %>% arrange(-n) %>%
+  slice_max(n, n=10) %>%
+  ggplot(aes(
+    x=reorder(CATEGORY_LIST, n),
+    y=n
+  )) + 
+  geom_bar(stat='identity') +
+  coord_flip() +
+  theme_ipsum() +
+  labs(
+    x='',
+    y='Count of investments',
+    title='Categories of Investments by Top 5% of Investors Across All Rounds'
+  )
+ggsave(fig, filename='plots/topinvestors_counts_bycategory.png', width=12)
+```
+
+# Statistical Analysis
+
+## Feature Correlations
+
+```{r}
+vars = data %>%
+  select(NUM_FUNDING_ROUNDS,
+         TOTAL_FUNDING_USD,
+         RAISED_AMOUNT_USD,
+         POST_MONEY_VALUATION_USD,
+         INVESTOR_COUNT
+         ) %>%
+    filter(between(RAISED_AMOUNT_USD, quantile(RAISED_AMOUNT_USD, .01), quantile(RAISED_AMOUNT_USD, .99))) %>%
+    filter(between(TOTAL_FUNDING_USD, quantile(TOTAL_FUNDING_USD, .01), quantile(RAISED_AMOUNT_USD, .99)))
+
+cors=cor(na.omit(vars),method=c('pearson'))
+corrs_p = cor_pmat(vars)
+fig=ggcorrplot(cors, type = 'upper', lab=TRUE,hc.order=TRUE) + labs(title='Correlation Matrix') +
+  labs(
+    title='Correlation Matrix',
+    color='Correlation')
+ggsave(fig, filename='plots/corrplot.png', width=10)
+```
+
+## Fintech vs rest
+
+```{r}
+fintech = data %>%
+  select(
+    CATEGORY_LIST, 
+    INVESTMENT_TYPE,
+    TOTAL_FUNDING_USD,
+    ORG_NAME
+  ) %>% 
+  mutate(
+    fintech = as.factor(case_when(
+      str_detect(CATEGORY_LIST, 'FinTech') ~ TRUE,
+      .default = FALSE)
+    ))
+
+fig=fintech %>%
+  group_by(INVESTMENT_TYPE, fintech) %>%
+    summarise(mean = mean(TOTAL_FUNDING_USD, na.rm = TRUE),
+            sd = sd(TOTAL_FUNDING_USD, na.rm = TRUE),
+            n = n()) %>%
+    mutate(se = sd / sqrt(n),
+         lower.ci = mean - qt(1 - (0.05 / 2), n - 1) * se,
+         upper.ci = mean + qt(1 - (0.05 / 2), n - 1) * se) %>%
+  ggplot(aes(x=INVESTMENT_TYPE, y=mean, fill=fintech)) +
+  geom_bar(position='dodge', stat="identity", width=.5) +
+  geom_errorbar(aes(ymin=lower.ci, ymax=upper.ci), width=.2, position=position_dodge(0.5)) +
+  scale_y_continuous(labels = scales::unit_format(unit = "M", scale = 1e-7)) + 
+  theme_ipsum() +
+  scale_fill_ipsum() +
+  labs(
+    x='Investment Round',
+    y='Average Amount Raised',
+    fill='FinTech Status',
+    title='Average Raise in FinTech vs Everything Else By Stage',
+    caption="95% Confidence Intervals"
+  )
+ggsave(fig, filename='plots/fintech.png', width=12)
+```
+
+T-tests and F-tests to confirm confidence intervals
+
+```{r}
+
+#Seed investment
+seedtreatment = fintech %>% filter(fintech==TRUE,
+                                   INVESTMENT_TYPE=='seed')
+seedcontrol = fintech %>% filter(fintech==FALSE,
+                                 INVESTMENT_TYPE=='seed')
+
+#Homogenous variance test with Fisher's F-test
+var.test(seedtreatment$TOTAL_FUNDING_USD, seedcontrol$TOTAL_FUNDING_USD)
+
+#Variances are different, so Welch t-statistic
+t.test(seedtreatment$TOTAL_FUNDING_USD, seedcontrol$TOTAL_FUNDING_USD, var.equal = FALSE)
+
+
+seriesatreatment = fintech %>% filter(fintech==TRUE,
+                                   INVESTMENT_TYPE=='series_a')
+seriesacontrol = fintech %>% filter(fintech==FALSE,
+                                 INVESTMENT_TYPE=='series_a')
+
+#Homogenous variance test with Fisher's F-test
+var.test(seriesatreatment$TOTAL_FUNDING_USD, seriesacontrol$TOTAL_FUNDING_USD)
+
+#Variances are different, so Welch t-statistic
+t.test(seriesatreatment$TOTAL_FUNDING_USD, seriesacontrol$TOTAL_FUNDING_USD, var.equal = FALSE)
+
+
+seriesbtreatment = fintech %>% filter(fintech==TRUE,
+                                   INVESTMENT_TYPE=='series_b')
+seriesbcontrol = fintech %>% filter(fintech==FALSE,
+                                 INVESTMENT_TYPE=='series_b')
+
+#Homogenous variance test with Fisher's F-test
+var.test(seriesbtreatment$TOTAL_FUNDING_USD, seriesbcontrol$TOTAL_FUNDING_USD)
+
+#Variances are close to homogenous, so Student's two-sample t-statistic
+t.test(seriesbtreatment$TOTAL_FUNDING_USD, seriesbcontrol$TOTAL_FUNDING_USD, var.equal = TRUE)
+
+prettytab=rbind(
+  tidy(t.test(seedtreatment$TOTAL_FUNDING_USD, seedcontrol$TOTAL_FUNDING_USD, var.equal = FALSE)),
+  tidy(t.test(seriesatreatment$TOTAL_FUNDING_USD, seriesacontrol$TOTAL_FUNDING_USD, var.equal = FALSE)),
+  tidy(t.test(seriesbtreatment$TOTAL_FUNDING_USD, seriesbcontrol$TOTAL_FUNDING_USD, var.equal = TRUE))
+)
+prettytab$stage=c('seed','series_a','series_b')
+```
+
+## Overall seasonality across all investment stages
+
+```{r}
+fig=data %>%
+  group_by(week = week(LAST_FUNDING_ON)) %>%
+  count() %>%
+  ggplot(aes(
+    x=week,
+    y=n
+  )) +
+  geom_bar(stat='identity') +
+  theme_ipsum() +
+  #facet_wrap(~INVESTMENT_TYPE, scale='free',ncol=1) +
+  ggtitle('Number of investments by week') +
+  scale_fill_ipsum()
+ggsave(fig,filename='plots/weekly_investments.png',width=10)
+
+```
+
+## Seasonality across by stages
+
+```{r}
+fig=data %>%
+  group_by(month = month(LAST_FUNDING_ON)) %>%
+  mutate(moavg = mean(RAISED_AMOUNT_USD, na.rm=T)) %>%
+  ggplot(aes(
+    x=month,
+    y=moavg
+  )) +
+  geom_bar(stat='identity', position='dodge') +
+  scale_y_continuous(labels = scales::unit_format(unit = "M", scale = 1e-7)) +
+  #facet_wrap(~INVESTMENT_TYPE, scale='free', ncol=1) +
+  ggtitle('Average amount raised by month')
+ggsave(fig,filename='plots/monthly_average_raises_bystage.png',width=10)
+
+fig=data %>%
+  group_by(week=week(LAST_FUNDING_ON), INVESTMENT_TYPE) %>%
+  mutate(wkavg = mean(RAISED_AMOUNT_USD, na.rm=T)) %>%
+  ggplot(aes(
+    x=week,
+    y=wkavg
+  )) +
+  geom_bar(stat='identity', position='dodge') +
+  scale_y_continuous(labels = scales::unit_format(unit = "M", scale = 1e-7)) +
+  facet_wrap(~INVESTMENT_TYPE, scale='free', ncol=1) +
+  ggtitle('Average amount raised by week')
+ggsave(fig,filename='plots/weekly_average_raises_bystage.png',width=10)
+
+fig=data %>%
+  mutate(year=factor(year(LAST_FUNDING_ON))) %>%
+  group_by(week = week(LAST_FUNDING_ON), INVESTMENT_TYPE, year) %>%
+  count() %>%
+  ggplot(aes(
+    x=week,
+    y=n,
+    fill=year
+  )) +
+  geom_bar(stat='identity', position='dodge') +
+  facet_wrap(~INVESTMENT_TYPE, scale='free',ncol=1) +
+  ggtitle('Number of investments by week') +
+  scale_fill_ipsum()
+ggsave(fig,filename='plots/weekly_investments_byyear_bystage.png',width=10)
+
+fig=data %>%
+  group_by(week = week(LAST_FUNDING_ON), INVESTMENT_TYPE) %>%
+  count() %>%
+  ggplot(aes(
+    x=week,
+    y=n
+  )) +
+  geom_bar(stat='identity') +
+  theme_ipsum() +
+  facet_wrap(~INVESTMENT_TYPE, scale='free',ncol=1) +
+  ggtitle('Number of investments by week') +
+  scale_fill_ipsum()
+ggsave(fig,filename='plots/weekly_investments_bystage.png',width=10)
+```
+
+## Weekly investments in top cities
+
+```{r}
+topcities = data %>% group_by(CITY...16) %>% tally() %>% slice_max(n, n=10)
+
+fig=data %>%
+  filter(CITY...16 %in% topcities$CITY...16) %>%
+  group_by(week = week(LAST_FUNDING_ON), INVESTMENT_TYPE) %>%
+  count() %>%
+  ggplot(aes(
+    x=week,
+    y=n
+  )) +
+  geom_bar(stat='identity') +
+  facet_wrap(~INVESTMENT_TYPE, scale='free',ncol=1) +
+  ggtitle('Number of investments by week (Top 10 cities)') +
+  scale_fill_ipsum()
+ggsave(fig,filename='plots/weekly_investments_top10cities.png')
+
+fig=data %>%
+  filter(LEAD_INVESTOR_UUIDS %in% topinvestors$id) %>%
+  group_by(week = week(LAST_FUNDING_ON), INVESTMENT_TYPE) %>%
+  count() %>%
+  ggplot(aes(
+    x=week,
+    y=n
+  )) +
+  geom_bar(stat='identity') +
+  facet_wrap(~INVESTMENT_TYPE, scale='free',ncol=1) +
+  ggtitle('Number of investments by week (Top 5% Lead Investors)') +
+  scale_fill_ipsum()
+ggsave(fig,filename='plots/weekly_investments_top10cities.png')
+```
+
+# Scratch
+
+## \~ Top Cities by Investors and Stage
+
+```{r}
+fig=citysummary %>%
+  ungroup() %>% group_by(h1, INVESTMENT_TYPE) %>%
+  arrange(n) %>%
+  slice_max(n,n=10) %>%
+  ggplot(aes(
+    x=reorder_within(CITY,n, INVESTMENT_TYPE),
+    y=n,
+    fill=h1
+  )) +
+  geom_bar(stat='identity', position='dodge') +
+  scale_x_reordered() +
+  facet_wrap(~INVESTMENT_TYPE, scales='free',ncol=1) + 
+  coord_flip() + 
+  theme_ipsum() +
+  scale_fill_ipsum() +
+  labs(
+    x='',
+    y='',
+    title='Top 10 Cities by Number of Investments per Stage'
+  )
+ggsave(fig, filename='plots/topcities_byinvestors.png',width=15,height=12)
+```
+
+## \~Average invested by year and investment type
+
+```{r}
+fig=catgroups %>% 
+  group_by(year, INVESTMENT_TYPE) %>%
+  summarise(avgraised = mean(RAISED_AMOUNT_USD, na.rm=T)) %>%
+  ggplot(aes(
+    x=year,
+    y=avgraised,
+    fill=INVESTMENT_TYPE
+  )) + 
+  scale_y_continuous(labels = scales::unit_format(unit = "M", scale = 1e-7)) +
+  geom_bar(position='dodge', stat='identity') +
+  theme_ipsum() +
+  scale_fill_ipsum() +
+  labs(
+    title="Average Amount Raised By Year And Round",
+    x='Year of Raise',
+    y='Average Amount Raised'
+  )
+#ggsave(fig,filename='plots/avg_raise_size_by_stage_and_year.pdf', width=10,height=8)
+#ggsave(fig,filename='plots/avg_raise_size_by_stage_and_year.png', width=10,height=8)
+```
+
+## \~Sectors by raised amount by year
+
+```{r}
+# This chart is ugly
+catgroups %>% 
+  group_by(year, INVESTMENT_TYPE, CATEGORY_GROUPS_LIST) %>%
+  summarise(avgraise = mean(RAISED_AMOUNT_USD, na.rm=T)) %>%
+  ggplot(aes(
+    x=year,
+    y=avgraise,
+    fill=INVESTMENT_TYPE
+  )) + geom_bar(position='dodge', stat='identity') + 
+  facet_wrap(~CATEGORY_GROUPS_LIST, ncol=5) +
+scale_y_continuous(labels = scales::unit_format(unit = "M", scale = 1e-7)) #+
+  #theme_ipsum() +
+  #scale_fill_ipsum()
+```
+
+## \~Distribution of amount raised over sectors
+
+```{r}
+#cats %>% 
+#  filter(between(RAISED_AMOUNT_USD, quantile(RAISED_AMOUNT_USD, #.01), quantile(RAISED_AMOUNT_USD, .99))) %>%
+#  ggplot(aes(
+#    x=RAISED_AMOUNT_USD,
+#    fill=INVESTMENT_TYPE
+#  )) +
+#  scale_x_continuous(labels = 
+#                       scales::unit_format(
+#                         unit = "M", 
+#                         scale = 1e-7)) +
+#  geom_histogram(bins=30, position='dodge') +
+#  facet_wrap(~year) +
+#  labs(
+#    x='Amount Raised'
+#  )
+```
+
+## \~Average raised by year, investment type, and category group
+
+```{r}
+#Bad chart
+#fig=catgroups %>% 
+#  group_by(year, INVESTMENT_TYPE, CATEGORY_GROUPS_LIST) %>%
+#  summarise(avgraised = mean(RAISED_AMOUNT_USD, na.rm=T)) %>%
+#  ggplot(aes(
+#    x=year,
+#    y=avgraised,
+#    fill=INVESTMENT_TYPE
+#  )) + 
+#  geom_bar(position='dodge', stat='identity') +
+#  scale_y_continuous(labels = scales::unit_format(unit = "M", scale = 1e-7)) +
+#  facet_wrap(~CATEGORY_GROUPS_LIST, ncol=4)
+```
+
+## \~Average investment size by category
+
+```{r}
+#avgcats_tbl = cats %>% 
+#    group_by(year, INVESTMENT_TYPE, CATEGORY_LIST) %>%
+#    summarise(avgraised = mean(RAISED_AMOUNT_USD, na.rm=T))
+
+#avgcats_tbl %>%
+#  ggplot(aes(
+#    x=avgraised,
+#    fill=INVESTMENT_TYPE
+#  )) +
+#  geom_histogram(position='dodge', bins=30) +
+#  scale_y_continuous(labels = scales::unit_format(unit = "M", scale = 1e-8)) +
+#  facet_wrap(~year)
+  
+```
+
+## \~Founded age and number of rounds
+
+```{r}
+#data %>%
+#   group_by(month = lubridate::floor_date(FOUNDED_ON, "month")) %>%
+#    tally()
+
+#data %>%
+#    group_by(UUID...1) %>%
+#    arrange(FOUNDED_ON) %>%
+#    slice(1L)
+```
+
+## \~Frequency table of funding rounds
+
+```{r}
+data %>% group_by(NUM_FUNDING_ROUNDS) %>% tally() %>% print(n=25)
+repeats = data %>% group_by(UUID...1) %>% filter(n() > 1)
+multiples = data %>% group_by(UUID...1) %>% filter(n() > 2)
+```
+
+### \~By amount
+
+```{r}
+amtraised = catgroups %>%
+  group_by(CATEGORY_GROUPS_LIST, INVESTMENT_TYPE, year) %>%
+  summarise(
+    min=min(RAISED_AMOUNT_USD, na.rm=T),
+    max=max(RAISED_AMOUNT_USD, na.rm=T),
+    mean=mean(RAISED_AMOUNT_USD, na.rm=T),
+    sd=sd(RAISED_AMOUNT_USD, na.rm=T)
+  )
+
+catgroups %>% 
+  filter(RAISED_AMOUNT_USD<100000000 &
+           INVESTMENT_TYPE=='seed') %>%
+  ggplot(aes(
+  x=RAISED_AMOUNT_USD,
+  fill=CATEGORY_GROUPS_LIST
+)) + 
+  geom_boxplot() + 
+  facet_wrap(~year) +
+  theme(legend.position="none") +
+  labs(
+    #x='Year of Raise',
+    #y='Average Amount Raised',
+    title='Average Seed Amount Raised Per Year By Sector',
+    fill='Investment Round'
+  ) 
+```
+
+### \~By amount of investments
+
+```{r}
+roundsraised = catgroups %>%
+  group_by(CATEGORY_GROUPS_LIST, INVESTMENT_TYPE, year) %>%
+  summarise(
+    min=min(NUM_FUNDING_ROUNDS, na.rm=T),
+    max=max(NUM_FUNDING_ROUNDS, na.rm=T),
+    mean=mean(NUM_FUNDING_ROUNDS, na.rm=T),
+    sd=sd(NUM_FUNDING_ROUNDS, na.rm=T)
+  )
+
+roundsraised %>% 
+  mutate(CATEGORY_GROUPS_LIST = fct_reorder(CATEGORY_GROUPS_LIST, mean)) %>%
+  ggplot(aes(
+    x=CATEGORY_GROUPS_LIST,
+    y=mean,
+    fill=INVESTMENT_TYPE
+  )) + geom_bar(
+    position='dodge',
+    stat='identity'
+  ) +
+  coord_flip() +
+  facet_wrap(~year)
+```
+
+## \~Distribution of investments by city and state
+
+```{r}
+#geo %>% 
+#  filter(!is.na(h1)) %>%
+#  group_by(h1, INVESTMENT_TYPE, STATE) %>%
+#  count() %>%
+#  ggplot(aes(
+#    x=reorder(STATE, n),
+#    y=n, 
+#    fill=INVESTMENT_TYPE
+#  )) +
+#  geom_bar(stat='identity', position='dodge') +
+#  #facet_wrap(~INVESTMENT_TYPE, scale='free', ncol=1) +
+#  coord_flip()
+```
+
+## \~Monthly patterns
+
+```{r}
+#data %>%
+#  filter(between(RAISED_AMOUNT_USD, quantile(RAISED_AMOUNT_USD, .01), quantile(RAISED_AMOUNT_USD, .99))) %>%
+  #filter(INVESTMENT_TYPE=='seed') %>%
+#  group_by(month=month(LAST_FUNDING_ON), INVESTMENT_TYPE) %>%
+#  ggplot(aes(
+#    y = RAISED_AMOUNT_USD, 
+#    x = INVESTMENT_TYPE,
+#    group=INVESTMENT_TYPE)) +
+  #geom_boxplot(outlier.shape = NA) +
+#  geom_boxplot() +
+#  scale_y_continuous(labels = scales::unit_format(unit = "M", scale = 1e-7)) +
+#  ggtitle('Distribution of amount raised by month') +
+#  facet_wrap(~month, ncol=6) +
+#  coord_flip()
+
+
+```
+
+## \~Lead Investors In the Biggest Funded
+
+```{r}
+fig=investors %>%
+  group_by(LEAD_INVESTOR_UUIDS, INVESTMENT_TYPE) %>%
+  summarise(
+    total=mean(TOTAL_FUNDING_USD)
+  ) %>%
+  arrange(-total) %>%
+  ungroup() %>% group_by(INVESTMENT_TYPE) %>%
+  slice_max(total, n=10) %>%
+  left_join(investors_lookup, by=c('LEAD_INVESTOR_UUIDS'='id')) %>%
+  filter(!is.na(name)) %>%
+  ggplot(aes(
+    x=reorder_within(name,total,INVESTMENT_TYPE),
+    y=total
+  )) +
+  geom_bar(stat='identity') +
+  scale_x_reordered() +
+  facet_wrap(~INVESTMENT_TYPE, scales='free') +
+  coord_flip() +
+  theme_ipsum() +
+  labs(
+    x='',
+    y='Total Amount Raised',
+    title='Top 10 Investors by Stage and Average Total Funding'
+  ) +
+  scale_y_continuous(labels = scales::unit_format(unit = "M", scale = 1e-7))
+ggsave(fig, filename='plots/top10investors_totalraised.png',width=12)
+
+```
+
+## \~Lead Investors in the Biggest Raises
+
+```{r}
+fig=investors %>%
+  group_by(LEAD_INVESTOR_UUIDS, INVESTMENT_TYPE) %>%
+  summarise(
+    total=mean(RAISED_AMOUNT_USD)
+  ) %>%
+  arrange(-total) %>%
+  ungroup() %>% group_by(INVESTMENT_TYPE) %>%
+  slice_max(total, n=10) %>%
+  left_join(investors_lookup, by=c('LEAD_INVESTOR_UUIDS'='id')) %>%
+  filter(!is.na(name)) %>%
+  ggplot(aes(
+    x=reorder_within(name,total,INVESTMENT_TYPE),
+    y=total
+  )) +
+  geom_bar(stat='identity') +
+  scale_x_reordered() +
+  facet_wrap(~INVESTMENT_TYPE, scales='free') +
+  coord_flip() +
+  #theme_ipsum() +
+  labs(
+    x='',
+    y='Average Amount Raised',
+    title='Top 11 Investors by Stage and Average Amount Raised'
+  ) +
+  scale_y_continuous(labels = scales::unit_format(unit = "M", scale = 1e-7))
+#ggsave(fig, filename='plots/top10investors_raiseamts.pdf',width=10)
+ggsave(fig, filename='plots/top10investors_raiseamts.png',width=12)
+```
+
+## \~What categories are raising the most from the top investors?
+
+```{r}
+fig=cats %>%
+  filter(LEAD_INVESTOR_UUIDS %in% topinvestors$id) %>%
+  group_by(CATEGORY_LIST) %>% 
+  summarise(n=n()) %>%
+  arrange(desc(n), .by_group = TRUE) %>%
+  #filter(mean>(quantile(mean, .99))) %>%
+  slice_max(n, n=10) %>%
+  ggplot(aes(
+    x=reorder(CATEGORY_LIST, n),
+    y=n
+  )) + 
+  geom_bar(stat='identity') +
+  coord_flip() +
+  #scale_y_continuous(labels = scales::unit_format(unit = "M", scale = 1e-7)) +
+  theme_ipsum()
+ggsave(fig, filename='plots/topcats_topinvestors_amtinvestments.pdf')
+
+fig=catgroups %>%
+  filter(LEAD_INVESTOR_UUIDS %in% topinvestors$id) %>%
+  group_by(CATEGORY_GROUPS_LIST) %>% 
+    summarise(n=n()) %>%
+  arrange(desc(n), .by_group = TRUE) %>%
+  #filter(mean>(quantile(mean, .99))) %>%
+  slice_max(n, n=10) %>%
+  ggplot(aes(
+    x=reorder(CATEGORY_GROUPS_LIST, n),
+    y=n
+  )) + 
+geom_bar(stat='identity') +
+  coord_flip() +
+  #scale_y_continuous(labels = scales::unit_format(unit = "M", scale = 1e-7)) +
+  theme_ipsum()
+ggsave(fig, filename='plots/topcatgroups_topinvestors_amtinvestments.pdf')
+```
+
+## \~Other ways to look at sectors and categories invested in by the top 5%
+
+```{r}
+fig=catgroups %>%
+  filter(LEAD_INVESTOR_UUIDS %in% topinvestors$id) %>%
+  group_by(CATEGORY_GROUPS_LIST) %>% 
+  #summarise(mean=mean(RAISED_AMOUNT_USD)) %>%
+  summarise(n=n()) %>% arrange(-n) %>%
+  #arrange(desc(mean), .by_group = TRUE) %>%
+  #filter(mean>(quantile(mean, .99))) %>%
+  slice_max(n, n=10) %>%
+  ggplot(aes(
+    x=reorder(CATEGORY_GROUPS_LIST, n),
+    y=n
+  )) + 
+  geom_bar(stat='identity') +
+  coord_flip() +
+  #scale_y_continuous(labels = scales::unit_format(unit = "M", scale = 1e-7)) +
+  theme_ipsum() +
+  labs(
+    x='',
+    y='Count of investments',
+    title='Sectors of investments by top 5% of investors'
+  )
+#ggsave(fig, filename='plots/topcats_topinvestors_amtraised.pdf')
+ggsave(fig, filename='plots/topinvestors_counts_bysector.png')
+
+fig=catgroups %>%
+  filter(LEAD_INVESTOR_UUIDS %in% topinvestors$id) %>%
+  group_by(CATEGORY_GROUPS_LIST) %>% 
+  summarise(mean=mean(RAISED_AMOUNT_USD)) %>%
+  arrange(desc(mean), .by_group = TRUE) %>%
+  #filter(mean>(quantile(mean, .95))) %>%
+  slice_max(mean, n=10) %>%
+  ggplot(aes(
+    x=reorder(CATEGORY_GROUPS_LIST, mean),
+    y=mean
+  )) + 
+  geom_bar(stat='identity') +
+  coord_flip() +
+  scale_y_continuous(labels = scales::unit_format(unit = "M", scale = 1e-7)) +
+  theme_ipsum()
+ggsave(fig, filename='plots/topinvestors_amtraised_bysector.png')
+```
+
+## \~What categories are getting the most investments from the top 5% of investors by category?
+
+```{r}
+topinvestors = investors %>%
+  group_by(LEAD_INVESTOR_UUIDS) %>%
+  tally() %>%
+  arrange(-n) %>%
+  filter(n>quantile(n,.95)) %>% 
+  select('id'=LEAD_INVESTOR_UUIDS) %>%
+    left_join(investors_lookup, by='id')
+  
+fig=cats %>%
+  filter(LEAD_INVESTOR_UUIDS %in% topinvestors$id) %>%
+  group_by(CATEGORY_LIST, INVESTMENT_TYPE) %>% 
+  summarise(n=n()) %>% arrange(-n) %>%
+  #slice_max(n, n=10) %>%
+  filter(n, n>=quantile(n,.99))
+  ggplot(aes(
+    x=reorder(CATEGORY_LIST, n),
+    y=n
+  )) + 
+  geom_bar(stat='identity') +
+  facet_wrap(~INVESTMENT_TYPE)
+  coord_flip() +
+  theme_ipsum() +
+  labs(
+    x='',
+    y='Count of investments',
+    title='Categories of Investments by Top 5% of Investors Across All Rounds'
+  )
+#ggsave(fig, filename='plots/topcats_topinvestors_amtraised.pdf')
+#ggsave(fig, filename='plots/topinvestors_counts_bycategory.png', width=12)
+```
+
+## \~More seasonality
+
+```{r}
+fig=data %>%
+  group_by(month = month(LAST_FUNDING_ON)) %>%
+  mutate(moavg = mean(RAISED_AMOUNT_USD, na.rm=T)) %>%
+  ggplot(aes(
+    x=month,
+    y=moavg
+  )) +
+  geom_bar(stat='identity', position='dodge') +
+  scale_y_continuous(labels = scales::unit_format(unit = "M", scale = 1e-7)) +
+  #facet_wrap(~INVESTMENT_TYPE, scale='free', ncol=1) +
+  ggtitle('Average amount raised by month')
+ggsave(fig,filename='plots/monthly_average_raises.png',width=10)
+
+fig=data %>%
+  group_by(week=week(LAST_FUNDING_ON), INVESTMENT_TYPE) %>%
+  mutate(wkavg = mean(RAISED_AMOUNT_USD, na.rm=T)) %>%
+  ggplot(aes(
+    x=week,
+    y=wkavg
+  )) +
+  geom_bar(stat='identity', position='dodge') +
+  scale_y_continuous(labels = scales::unit_format(unit = "M", scale = 1e-7)) +
+  facet_wrap(~INVESTMENT_TYPE, scale='free', ncol=1) +
+  ggtitle('Average amount raised by week')
+ggsave(fig,filename='plots/weekly_average_raises.png',width=10)
+```
+
+<!--#  -->
