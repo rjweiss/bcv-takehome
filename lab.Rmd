@@ -5,7 +5,7 @@ output: html_notebook
 
 # Loading data
 
-```{r}
+```{r include=FALSE}
 #source('requirements.R')
 library(tidyverse)
 library(tidytext)
@@ -22,11 +22,9 @@ hrbrthemes::import_public_sans()
 options(scipen=999)
 showtext::showtext_auto()
 showtext::showtext_opts(dpi = 300)
-extrafont::font_import() #
-extrafont::loadfonts(device='pdf')
+#extrafont::font_import() #
+#extrafont::loadfonts(device='pdf')
 ```
-
-What does this data look like?
 
 ```{r}
 data=read_csv('BCV data science take home_data set.csv')
@@ -48,13 +46,6 @@ data = data %>% filter(!is.na(CATEGORY_LIST) & !is.na(CATEGORY_GROUPS_LIST))
 data = data %>% filter(!is.na(RAISED_AMOUNT_USD)) 
 data = data %>% filter(!is.na(TOTAL_FUNDING_USD)) 
 ```
-
-## \~Detecting and removing outliers
-
-Proposed criteria **for exploratory analysis.**
-
--   Have not raised more than 100M in any round
--   Remove 1% and 99% of a variable (e.g. `RAISED_AMOUNT_USD`)
 
 ## Confirming assumptions
 
@@ -343,7 +334,6 @@ fig=cats %>%
     y='Average Amount of Investors',
     title='Top 1% Categories in Series A Rounds') +
   coord_flip()
-#ggsave(fig, filename='plots/top_cats_by_investors_seriesa.pdf',width=10)
 ggsave(fig, filename='plots/top_cats_by_investors_seriesa.png',width=10)
 
 fig=cats %>% 
